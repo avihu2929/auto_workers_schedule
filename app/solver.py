@@ -491,10 +491,12 @@ def solve(
                 cell += ", " + ", ".join(assigned[1:])
             result.entries[day][shift] = cell
 
-    # if greedy left slots unfilled, attempt exact solvers for a completeness
-    if result.unfilled and not _impossible_by_capacity(
-        workers, days, shift_names, required_counts, rest_gap
-    ):
+    # if greedy left slots unfilled, attempt exact solvers for a completeness.
+    # This runs even when must rules provably make full demand unreachable
+    # (the capacity warning above is heads-up only): CP-SAT maximizes
+    # partial coverage, so it can still beat the greedy result and the
+    # strict-improvement comparison below keeps the better of the two.
+    if result.unfilled:
         greedy_coverage = count_assignments(result.entries)
         greedy_tries = honored_tries(state)
         attempt = _cpsat_exact_cover(
