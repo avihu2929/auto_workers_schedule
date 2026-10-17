@@ -28,6 +28,9 @@ from .rules_dialog import RulesDialog
 BG_NORMAL = QColor("#eceff1")
 BG_TRY = QColor("#ffd54f")
 TXT_NORMAL = "#37474f"
+TEXT_UNAVAILABLE = "לא זמין"
+TEXT_NORMAL = "פנוי"
+TEXT_TRY = "מעדיף"
 
 
 class NameDialog(QDialog):
@@ -139,7 +142,7 @@ class MainApp(QWidget):
         grid_col.setContentsMargins(0, 0, 0, 0)
         legend = QLabel(
             "זמינות שבועית – לחץ לסימון   "
-            '(אפור=סגור, בהיר=רגיל, צהוב="נסה לשבץ")'
+            f'(אפור={TEXT_UNAVAILABLE}, בהיר={TEXT_NORMAL}, צהוב={TEXT_TRY})'
         )
         legend.setStyleSheet("color: #555;")
         grid_col.addWidget(legend)
@@ -172,7 +175,7 @@ class MainApp(QWidget):
         for r in range(t.rowCount()):
             for c in range(t.columnCount()):
                 item = QTableWidgetItem()
-                item.setText("—")
+                item.setText(TEXT_UNAVAILABLE)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setBackground(self.palette().window().color())
@@ -282,16 +285,16 @@ class MainApp(QWidget):
                 item = t.item(r, c)
                 day, shift = self.days[c], self.shift_names[r]
                 if w is None or not w.is_available(day, shift):
-                    item.setText("—")
+                    item.setText(TEXT_UNAVAILABLE)
                     item.setBackground(self.palette().window().color())
                     item.setForeground(QColor("#90a4ae"))
                     continue
                 item.setForeground(QColor(TXT_NORMAL))
                 if w.prefers(day, shift):
-                    item.setText("try")
+                    item.setText(TEXT_TRY)
                     item.setBackground(BG_TRY)
                 else:
-                    item.setText("N")
+                    item.setText(TEXT_NORMAL)
                     item.setBackground(BG_NORMAL)
 
     # -------------------------------------------------------------- save
