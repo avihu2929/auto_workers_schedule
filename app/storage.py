@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .model import Rule, Worker
+from . import paths
 
-DEFAULT_WORKERS_FILE = Path(__file__).resolve().parent.parent / "workers.json"
-DEFAULT_RULES_FILE = Path(__file__).resolve().parent.parent / "rules.json"
+DEFAULT_WORKERS_FILE = paths.WORKERS_FILE
+DEFAULT_RULES_FILE = paths.RULES_FILE
 
 
 def _write_json_atomic(path: Path, data: object) -> None:

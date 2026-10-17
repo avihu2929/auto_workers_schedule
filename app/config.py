@@ -4,7 +4,9 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+from . import paths
+
+CONFIG_PATH = paths.CONFIG_FILE
 
 
 def load_config(path: Path = CONFIG_PATH) -> Tuple[List[str], Dict[str, str]]:
