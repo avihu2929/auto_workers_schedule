@@ -447,6 +447,16 @@ def solve(
             if v
             for _w in v.split(", ")
         )
+        greedy_tries = sum(
+            1
+            for w in workers
+            for day, cells in w.cell_priority.items()
+            for shift in cells
+            if day in days
+            and shift in shift_names
+            and days.index(day) * len(shift_names) + shift_names.index(shift)
+            in state[w.name].orders
+        )
         attempt = _cpsat_exact_cover(
             workers, days, shift_names, required_counts,
             rest_rule, rest_gap, global_rules,
@@ -485,17 +495,28 @@ def solve(
             fixed = _exact_cover_search(
                 workers, days, shift_names, required_counts,
                 rest_rule, rest_gap, rest_soft, candidates_for,
+                slots_order=try_slots + other_slots,
             )
             result.traces.append(fixed["trace"])
-            if fixed["complete"]:
+            fixed_coverage = sum(
+                1
+                for d in fixed["entries"]
+                for v in fixed["entries"][d].values()
+                if v
+                for _w in v.split(", ")
+            )
+            if fixed["complete"] and (fixed_coverage, fixed["tries"]) > (
+                greedy_coverage, greedy_tries
+            ):
                 result.entries = fixed["entries"]
                 result.unfilled = []
                 result.warnings = []
                 state = fixed["state"]
             else:
                 result.warnings.append(
-                    "החיפוש הרחב לא מצא סידור מלא בזמן המוקצב "
-                    f"({fixed['steps']} בדיקות) – מוצג הסידור החלקי הטוב שנמצא"
+                    "החיפוש הרחב לא מצא שיבוץ חוקי טוב מהנוכחי "
+                    f"({fixed['steps']} בדיקות, עדיפויות מומשו: {fixed['tries']}) "
+                    "– נשאר הסידור הנוכחי"
                 )
 
     result.warnings.extend(_post_warnings(workers, state, days, shift_names))
@@ -581,14 +602,16 @@ def _exact_cover_search(
     rest_gap: int | None,
     rest_soft: bool,
     candidates_for,
+    slots_order: list[tuple[int, int]] | None = None,
 ) -> dict:
     """Bounded DFS for a fully-covered schedule using the same rule engine.
 
     Returns {"complete": bool, "entries": dict, "state": dict, "steps": int,
-    "trace": dict}. Falls back gracefully when the time budget runs out —
-    the caller keeps the greedy result in that case.
+    "tries": int, "trace": dict}. Falls back gracefully when the time budget
+    runs out — the caller keeps the greedy result in that case.
+    Uses the preference-first slot ordering when one is supplied.
     """
-    slots_seq = sorted(
+    slots_seq = slots_order or sorted(
         ((di, si) for di in range(len(days)) for si in range(len(shift_names))),
         key=lambda t: (t[1], t[0]),  # shift-major
     )
@@ -671,15 +694,26 @@ def _exact_cover_search(
             )
             if assigned:
                 entries[day][shift] = ", ".join(assigned)
+    tries = sum(
+        1
+        for w in workers
+        for day, cells in w.cell_priority.items()
+        for shift in cells
+        if day in days
+        and shift in shift_names
+        and days.index(day) * len(shift_names) + shift_names.index(shift)
+        in st[w.name].orders
+    )
     trace = {
         "stage": "search",
         "complete": complete,
         "steps": steps,
+        "tries": tries,
         "timed_out": timed_out,
         "seconds": round(_time.monotonic() - start, 2),
     }
     return {"complete": complete, "entries": entries, "state": st,
-            "steps": steps, "trace": trace}
+            "steps": steps, "tries": tries, "trace": trace}
 
 
 def explain_slot(
