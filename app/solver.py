@@ -15,7 +15,7 @@ FAIRNESS_WEIGHT = 5
 
 SEARCH_BUDGET_SECONDS = 4.0
 SEARCH_CANDIDATE_BRANCH_LIMIT = 8
-CPSAT_TIME_LIMIT_SECONDS = 5.0
+CPSAT_TIME_LIMIT_SECONDS = 6.0
 
 
 @dataclass
@@ -67,6 +67,19 @@ class _WorkerState:
     days: set[str] = field(default_factory=set)
 
 
+def _per_worker_cap(
+    worker: Worker, num_slots: int, rest_gap: int | None
+) -> int | None:
+    """Hard cap on a worker's assignment count: the rest-rule arithmetic
+    bound tightened by must-priority max rules. None = unlimited."""
+    rest_cap = (num_slots - 1) // rest_gap + 1 if rest_gap else num_slots
+    cap: int | None = rest_cap
+    r = _worker_rule(worker, "max_week_shifts")
+    if r is not None and r.priority == MUST:
+        cap = min(cap, int(r.params.get("n", 0)))
+    return cap
+
+
 def _capacity_stats(
     workers: list[Worker], days: list[str], shift_names: list[str],
     required_counts: dict[str, int], rest_gap: int | None,
@@ -74,25 +87,26 @@ def _capacity_stats(
     """Returns (demand, capacity, max_per_worker).
 
     demand = total required assignments for the week.
-    capacity = max assignments allowed by the rest rule alone (per worker).
+    capacity = what the must rules allow all workers combined.
     """
     num_slots = len(days) * len(shift_names)
     max_per_worker = (num_slots - 1) // rest_gap + 1 if rest_gap else num_slots
-    capacity = sum(
-        max_per_worker for w in workers
-        if any(w.is_available(d, s) for d in days for s in shift_names)
-    )
+    capacity = 0
+    for w in workers:
+        if not any(w.is_available(d, s) for d in days for s in shift_names):
+            continue
+        cap = _per_worker_cap(w, num_slots, rest_gap)
+        capacity += cap if cap is not None else num_slots
     demand = sum(required_counts.values()) * len(days)
     return demand, capacity, max_per_worker
 
 
 def _impossible_by_capacity(
     workers: list[Worker], days: list[str], shift_names: list[str],
-    required_counts: dict[str, int], rest_rule: Rule | None, rest_gap: int | None,
+    required_counts: dict[str, int], rest_gap: int | None,
 ) -> bool:
-    """True when a must rest rule provably makes full demand unreachable."""
-    if rest_rule is None or rest_rule.priority != MUST or not rest_gap:
-        return False
+    """True when must rules (rest + per-worker caps) provably make full
+    demand unreachable."""
     demand, capacity, _ = _capacity_stats(
         workers, days, shift_names, required_counts, rest_gap
     )
@@ -108,14 +122,15 @@ def _cpsat_exact_cover(
     rest_gap: int | None,
     global_rules: list[Rule] | None,
 ) -> dict | None:
-    """Exact-cover attempt with CP-SAT (requires ortools).
+    """Exact solver with CP-SAT (requires ortools).
 
     Hard: availability, per-slot required counts (as upper bounds), must-
-    priority worker caps and must-priority rest distance. Objective: first
-    maximize total coverage, tie-break on "try" cells; with a fairness rule
-    also try to balance loads when that keeps coverage optimal.
-    Returns {"entries", "state", "full", "coverage", "demand"} or None if
-    ortools is missing or no feasible solution was found.
+    priority worker caps (shifts + distinct days) and must-priority rest
+    distance. Objective: maximize coverage, tie-break on "try" cells; with
+    a fairness rule, load spread is only tightened when it provably keeps
+    the coverage optimum.
+    Returns {"entries", "state", "full", "coverage", "demand", "tries"} or
+    None if ortools is missing or no feasible solution was found.
     """
     try:
         from ortools.sat.python import cp_model
@@ -129,12 +144,17 @@ def _cpsat_exact_cover(
     for di, day in enumerate(days):
         for si, shift in enumerate(shift_names):
             slot_of[di * n_shifts + si] = (day, shift)
+    tries_of = {
+        (w.name, o)
+        for o, (day, shift) in slot_of.items()
+        for w in workers
+        if w.is_available(day, shift) and w.prefers(day, shift)
+    }
 
     def build_model(spread_limit: int | None):
         m = cp_model.CpModel()
         x: dict[tuple[str, int], object] = {}
         for o, (day, shift) in slot_of.items():
-            di, si = divmod(o, n_shifts)
             for w in workers:
                 if w.is_available(day, shift):
                     x[w.name, o] = m.NewBoolVar(f"x_{w.name}_{o}")
@@ -198,35 +218,37 @@ def _cpsat_exact_cover(
         # preferences can never beat coverage)
         obj = TRY_BONUS * sum(x.values())
         for (nm, o), v in x.items():
-            day, shift = slot_of[o]
-            if any(w.name == nm and w.prefers(day, shift) for w in workers):
+            if (nm, o) in tries_of:
                 obj += 10 * v
         m.Maximize(obj)
         return m, x
 
-    spread_levels = (2, 3, None) if _global_rule(global_rules, "fairness") else (None,)
-    chosen = None
-    fallback = None
-    for spread in spread_levels:
-        m, x = build_model(spread)
-        s = cp_model.CpSolver()
-        s.parameters.max_time_in_seconds = CPSAT_TIME_LIMIT_SECONDS
-        status = s.Solve(m)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            continue
-        coverage_at = sum(s.Value(v) for v in x.values())
-        if spread is None and coverage_at > (fallback["coverage"] if fallback else -1):
-            fallback = (m, x, s, coverage_at)
-        # a fairness-constrained level only wins if it still achieves the
-        # full demand — otherwise the spread is costing us coverage
-        if spread is not None and status == cp_model.OPTIMAL and coverage_at >= demand:
-            chosen = (m, x, s)
-            break
-    if chosen is None and fallback is not None:
-        chosen = fallback[:3]
-    if chosen is None:
+    # base first; fairness spreads attempted only as refinement of an
+    # optimally-proven base (avoids burning the time budget on levels that
+    # can't reach the coverage optimum)
+    m, x = build_model(None)
+    s = cp_model.CpSolver()
+    s.parameters.max_time_in_seconds = CPSAT_TIME_LIMIT_SECONDS
+    status = s.Solve(m)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
-    m, x, s = chosen
+    coverage = sum(s.Value(v) for v in x.values())
+    base_optimal = status == cp_model.OPTIMAL
+
+    chosen = (None, m, x, s)
+    if base_optimal and _global_rule(global_rules, "fairness"):
+        for spread in (2, 3):
+            m_r, x_r = build_model(spread)
+            s_r = cp_model.CpSolver()
+            s_r.parameters.max_time_in_seconds = 3.0
+            status_r = s_r.Solve(m_r)
+            if status_r != cp_model.OPTIMAL:
+                continue
+            coverage_r = sum(s_r.Value(v) for v in x_r.values())
+            if coverage_r == coverage:  # same optimum, fairer load
+                chosen = (spread, m_r, x_r, s_r)
+                break
+    _, m, x, s = chosen
 
     entries = {d: {} for d in days}
     state = {w.name: _WorkerState() for w in workers}
@@ -249,8 +271,9 @@ def _cpsat_exact_cover(
         if v
         for _w in v.split(", ")
     )
+    tries = sum(1 for (nm, oo) in tries_of if s.Value(x[nm, oo]))
     return {"entries": entries, "state": state, "full": coverage >= demand,
-            "coverage": coverage, "demand": demand}
+            "coverage": coverage, "demand": demand, "tries": tries}
 
 
 def solve(
@@ -264,8 +287,8 @@ def solve(
 
     Strategy: greedy pass (try-cells first, most-constrained slots first);
     if slots remain unfilled, an exact solver (CP-SAT, then bounded DFS)
-    tries to find a fully-covered schedule under the same hard rules and
-    replaces the greedy result when it succeeds.
+    tries to do better — replacement only when both coverage AND honored
+    preferences improve (coverage always dominates).
     """
     result = SolverResult()
     result.entries = {day: {} for day in days}
@@ -288,19 +311,53 @@ def solve(
     rest_gap: int | None = int(rest_n) + 1 if rest_n else None
     required_counts = _required_counts(global_rules or [], shift_names)
 
-    # feasibility heads-up: with a must rest rule the total demand may exceed
-    # what all workers combined may legally cover
-    if rest_rule is not None and rest_rule.priority == MUST and rest_gap:
+    # feasibility heads-up: must rules may make full demand unreachable
+    if _impossible_by_capacity(
+        workers, days, shift_names, required_counts, rest_gap
+    ):
         demand, capacity, max_per_worker = _capacity_stats(
             workers, days, shift_names, required_counts, rest_gap
         )
-        if demand > capacity:
-            result.warnings.insert(0, (
-                f"הסידור לא יוכל להתמלא במלואו: נדרשות {demand} שיבוצים "
-                f"אך העובדים יכולים לכסות לכל היותר {capacity} "
-                f" לפי כלל ההפסקה (מקסימום {max_per_worker} משמרות לעובד). "
-                "הפחת דרישות, הוסף עובדים, או הקל על כלל ההפסקה."
-            ))
+        result.warnings.insert(0, (
+            f"הסידור לא יוכל להתמלא במלואו: נדרשות {demand} שיבוצים "
+            f"אך העובדים יכולים לכסות לכל היותר {capacity} "
+            "לפי הכללים (הפסקה ומקסימומים). "
+            "הפחת דרישות, הוסף עובדים, או הקל על הכללים."
+        ))
+
+    def count_assignments(entries: dict) -> int:
+        return sum(
+            1
+            for d in entries
+            for v in entries[d].values()
+            if v
+            for _w in v.split(", ")
+        )
+
+    def rebuild_unfilled(entries: dict) -> None:
+        for d in days:
+            for sh in shift_names:
+                picked = entries[d].get(sh, "")
+                count = len(picked.split(", ")) if picked else 0
+                need = required_counts[sh]
+                if count == 0:
+                    result.unfilled.append(
+                        (d, sh, f"נדרשים {need} עובדים – אין אף עובד זמין")
+                    )
+                elif count < need:
+                    result.unfilled.append((d, sh, f"משובצו {count} מתוך {need}"))
+
+    def honored_tries(st: dict[str, _WorkerState]) -> int:
+        return sum(
+            1
+            for w in workers
+            for day, cells in w.cell_priority.items()
+            for shift in cells
+            if day in days
+            and shift in shift_names
+            and days.index(day) * len(shift_names) + shift_names.index(shift)
+            in st[w.name].orders
+        )
 
     def violates_rest(name: str, order: int, st: dict | None = None) -> bool:
         if rest_gap is None:
@@ -322,8 +379,7 @@ def solve(
             else:
                 score = BASE_SCORE
 
-                cell_try = w.prefers(day, shift)
-                if cell_try:
+                if w.prefers(day, shift):
                     score += TRY_BONUS
 
                 add_day = day not in wst.days
@@ -366,7 +422,6 @@ def solve(
     def slot_key(slot: tuple[int, int]):
         di, si = slot
         day, shift = days[di], shift_names[si]
-        order = di * len(shift_names) + si
         cands = [
             w for w in workers
             if w.is_available(day, shift)
@@ -438,48 +493,24 @@ def solve(
 
     # if greedy left slots unfilled, attempt exact solvers for a completeness
     if result.unfilled and not _impossible_by_capacity(
-        workers, days, shift_names, required_counts, rest_rule, rest_gap
+        workers, days, shift_names, required_counts, rest_gap
     ):
-        greedy_coverage = sum(
-            1
-            for d in result.entries
-            for v in result.entries[d].values()
-            if v
-            for _w in v.split(", ")
-        )
-        greedy_tries = sum(
-            1
-            for w in workers
-            for day, cells in w.cell_priority.items()
-            for shift in cells
-            if day in days
-            and shift in shift_names
-            and days.index(day) * len(shift_names) + shift_names.index(shift)
-            in state[w.name].orders
-        )
+        greedy_coverage = count_assignments(result.entries)
+        greedy_tries = honored_tries(state)
         attempt = _cpsat_exact_cover(
             workers, days, shift_names, required_counts,
             rest_rule, rest_gap, global_rules,
         )
         replaced = False
-        if attempt is not None and attempt["coverage"] > greedy_coverage:
+        if attempt is not None and (
+            attempt["coverage"], attempt["tries"]
+        ) > (greedy_coverage, greedy_tries):
             result.entries = attempt["entries"]
             result.warnings = []
             result.unfilled = []
             state = attempt["state"]
             replaced = True
-            # rebuild unfilled from the optimized entries
-            for d in days:
-                for sh in shift_names:
-                    picked = result.entries[d].get(sh, "")
-                    count = len(picked.split(", ")) if picked else 0
-                    need = required_counts[sh]
-                    if count == 0:
-                        result.unfilled.append(
-                            (d, sh, f"נדרשים {need} עובדים – אין אף עובד זמין")
-                        )
-                    elif count < need:
-                        result.unfilled.append((d, sh, f"משובצו {count} מתוך {need}"))
+            rebuild_unfilled(result.entries)
             if attempt["full"]:
                 result.traces.append({"stage": "cpsat", "complete": True})
             else:
@@ -498,18 +529,12 @@ def solve(
                 slots_order=try_slots + other_slots,
             )
             result.traces.append(fixed["trace"])
-            fixed_coverage = sum(
-                1
-                for d in fixed["entries"]
-                for v in fixed["entries"][d].values()
-                if v
-                for _w in v.split(", ")
-            )
-            if fixed["complete"] and (fixed_coverage, fixed["tries"]) > (
-                greedy_coverage, greedy_tries
-            ):
+            fixed_coverage = count_assignments(fixed["entries"])
+            if (fixed_coverage, fixed["tries"]) > (greedy_coverage, greedy_tries):
                 result.entries = fixed["entries"]
                 result.unfilled = []
+                if not fixed["complete"]:
+                    rebuild_unfilled(result.entries)
                 result.warnings = []
                 state = fixed["state"]
             else:
@@ -534,7 +559,7 @@ def solve(
                 if order not in state[w.name].orders:
                     result.warnings.append(
                         f"{w.name}: עדיפות \"נסה לשבץ\" ביום {day} ({shift}) "
-                        "לא מומשה – מימושה היה עולה בכיסוי"
+                        "לא מומשה"
                     )
     return result
 
@@ -604,12 +629,11 @@ def _exact_cover_search(
     candidates_for,
     slots_order: list[tuple[int, int]] | None = None,
 ) -> dict:
-    """Bounded DFS for a fully-covered schedule using the same rule engine.
+    """Bounded DFS for a better-covered schedule using the same rule engine.
 
     Returns {"complete": bool, "entries": dict, "state": dict, "steps": int,
-    "tries": int, "trace": dict}. Falls back gracefully when the time budget
-    runs out — the caller keeps the greedy result in that case.
-    Uses the preference-first slot ordering when one is supplied.
+    "tries": int, "trace": dict}. Uses the preference-first slot ordering
+    when one is supplied.
     """
     slots_seq = slots_order or sorted(
         ((di, si) for di in range(len(days)) for si in range(len(shift_names))),
@@ -621,16 +645,10 @@ def _exact_cover_search(
     steps = 0
     timed_out = False
 
-    # per-worker hard assignment cap (min of must rules and rest arithmetic cap)
     num_slots = len(days) * len(shift_names)
-    cap_rest = (num_slots - 1) // rest_gap + 1 if rest_gap else num_slots
-    caps: dict[str, int | None] = {}
-    for w in workers:
-        cap = None
-        r = _worker_rule(w, "max_week_shifts")
-        if r is not None and r.priority == MUST:
-            cap = int(r.params.get("n", 0))
-        caps[w.name] = cap if cap in (None, 0) else min(cap, cap_rest)
+    caps: dict[str, int | None] = {
+        w.name: _per_worker_cap(w, num_slots, rest_gap) for w in workers
+    }
 
     def assign(idx: int) -> bool:
         nonlocal steps, timed_out
@@ -660,7 +678,7 @@ def _exact_cover_search(
                 required_counts[shift_names[dsi[1]]] for dsi in slots_seq[idx:]
             )
             avail = sum(
-                max(0, (caps[w.name] if caps[w.name] is not None else cap_rest)
+                max(0, (caps[w.name] if caps[w.name] is not None else num_slots)
                     - len(st[w.name].orders))
                 for w in workers
             )
