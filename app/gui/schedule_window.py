@@ -159,4 +159,9 @@ class ScheduleWindow(QWidget):
             lines.extend(f"• {w}" for w in result.warnings[:12])
             if len(result.warnings) > 12:
                 lines.append("• ...")
+        if getattr(result, "unused_report", None):
+            lines.append("זמינות לא מנוצלת:")
+            lines.extend(f"{ln}" for ln in result.unused_report[:40])
+            if len(result.unused_report) > 40:
+                lines.append("...")
         self._status.setText("\n".join(lines) if lines else "הסידור מלא – אין הערות")

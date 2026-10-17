@@ -29,6 +29,8 @@ class SolverResult:
     traces: list[dict] = field(default_factory=list)
     # final assignment state: worker name -> _WorkerState
     state: dict = field(default_factory=dict)
+    # human-readable notes about unused worker availability
+    unused_report: list[str] = field(default_factory=list)
 
 
 def _worker_rule(worker: Worker, key: str) -> Rule | None:
@@ -515,7 +517,90 @@ def solve(
                         f"{w.name}: עדיפות \"נסה לשבץ\" ביום {day} ({shift}) "
                         "לא מומשה – מימושה היה עולה בכיסוי"
                     )
+
+    result.unused_report = _unused_report(
+        workers, days, shift_names, state, required_counts,
+        rest_rule, rest_gap,
+    )
     return result
+
+
+def _unused_report(
+    workers: list[Worker],
+    days: list[str],
+    shift_names: list[str],
+    state: dict[str, _WorkerState],
+    required_counts: dict[str, int],
+    rest_rule: Rule | None,
+    rest_gap: int | None,
+    detail_limit: int = 5,
+) -> list[str]:
+    """List workers whose availability wasn't fully used, with reasons.
+
+    For each available-but-unassigned slot of a worker the reason is one of:
+    hard cap reached / rest requirement (points at the blocking slot) / the
+    slot was already fully staffed / plain preference loss. "Slot full"
+    occurrences are aggregated as a count since they are the normal case.
+    """
+    n_shifts = len(shift_names)
+    num_slots = len(days) * n_shifts
+    slot_name = {o: f"{days[o // n_shifts]} {shift_names[o % n_shifts]}"
+                 for o in range(num_slots)}
+    slot_owners: dict[int, list[str]] = {o: [] for o in range(num_slots)}
+    for w in workers:
+        wst = state.get(w.name)
+        if wst is None:
+            continue
+        for o in wst.orders:
+            slot_owners[o].append(w.name)
+
+    lines: list[str] = []
+    for w in workers:
+        wst = state.get(w.name)
+        if wst is None:
+            continue
+        available = [
+            o for o in range(num_slots)
+            if w.is_available(days[o // n_shifts], shift_names[o % n_shifts])
+        ]
+        unused = [o for o in available if o not in wst.orders]
+        if not unused:
+            continue
+
+        r_shifts = _worker_rule(w, "max_week_shifts")
+        r_days = _worker_rule(w, "max_week_days")
+        cap_shifts = int(r_shifts.params.get("n", 0)) if r_shifts is not None else None
+        cap_days = int(r_days.params.get("n", 0)) if r_days is not None else None
+
+        by_reason: dict[str, list[str]] = {}
+        for o in unused:
+            o_day, o_shift = days[o // n_shifts], shift_names[o % n_shifts]
+            if r_shifts is not None and r_shifts.priority == MUST and len(wst.orders) >= cap_shifts:
+                reason = "הגיע למקסימום משמרות"
+            elif r_days is not None and r_days.priority == MUST and len(wst.days) >= cap_days:
+                reason = "הגיע למקסימום ימים"
+            elif rest_gap and any(abs(x - o) < rest_gap for x in wst.orders):
+                nearest = min(wst.orders, key=lambda x: abs(x - o))
+                reason = (
+                    f"הפסקה (צמוד: {slot_name[nearest]})"
+                )
+            elif len(slot_owners[o]) >= required_counts[o_shift]:
+                reason = "משמרת מלאה"
+            else:
+                reason = "לא נבחר (עדיפויות/כיסוי)"
+            by_reason.setdefault(reason, []).append(slot_name[o])
+
+        lines.append(
+            f"{w.name}: שובץ {len(wst.orders)} מתוך {len(available)} משמרות זמינות"
+            f" (לא מנוצלות: {len(unused)})"
+        )
+        for reason, slots in by_reason.items():
+            shown = ", ".join(slots[:detail_limit])
+            extra = len(slots) - detail_limit
+            if extra > 0:
+                shown += f" ועוד {extra}"
+            lines.append(f"   – {reason}: {shown}")
+    return lines
 
 
 def _post_warnings(
